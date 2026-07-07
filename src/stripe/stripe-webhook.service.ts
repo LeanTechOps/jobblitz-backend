@@ -405,6 +405,7 @@ export class StripeWebhookService {
   /**
    * invoice.finalized
    * Create Invoice + initial Payment record in DB.
+   * Skip $0 invoices (trial or free plan) — they have no PaymentIntent so no Payment row is needed.
    */
   private async handleInvoiceFinalized(invoice: Stripe.Invoice) {
     const stripeSubId = extractSubscriptionIdFromInvoice(invoice)
@@ -412,6 +413,11 @@ export class StripeWebhookService {
       `[INVOICE_FINALIZED] invoiceId=${invoice.id} stripeSubId=${stripeSubId ?? 'none'} ` +
       `amountDue=${(invoice.amount_due ?? 0) / 100} status=${invoice.status}`,
     )
+
+    if ((invoice.amount_due ?? 0) === 0) {
+      this.logger.log(`[INVOICE_FINALIZED] Skipping $0 invoice ${invoice.id} (trial/free — no payment needed)`)
+      return
+    }
 
     // Resolve our internal subscription record
     let internalSub = await this.findSubscriptionForInvoice(invoice)
@@ -517,11 +523,17 @@ export class StripeWebhookService {
   /**
    * invoice.paid
    * Mark invoice and linked payment as SUCCEEDED.
+   * Skip $0 invoices (trial/free) — no payment row was created for them.
    */
   private async handleInvoicePaid(invoice: Stripe.Invoice) {
     this.logger.log(
       `[INVOICE_PAID] invoiceId=${invoice.id} amountPaid=${(invoice.amount_paid ?? 0) / 100}`,
     )
+
+    if ((invoice.amount_paid ?? 0) === 0) {
+      this.logger.log(`[INVOICE_PAID] Skipping $0 invoice ${invoice.id} (trial/free — no payment record)`)
+      return
+    }
 
     const dbInvoice = await this.prisma.invoice.findUnique({
       where: { stripeInvoiceId: invoice.id },
@@ -621,167 +633,162 @@ export class StripeWebhookService {
 
   /**
    * payment_intent.succeeded
-   * Mark payment SUCCEEDED and capture card details via latest_charge.
+   * Scrummer-style: find or create the Payment row in a single transaction.
+   * Handles race where invoice.finalized fires before Stripe attaches the PI to the invoice.
    */
   private async handlePaymentIntentSucceeded(paymentIntent: Stripe.PaymentIntent) {
+    const piAny = paymentIntent as any
     this.logger.log(`[PI_SUCCEEDED] paymentIntentId=${paymentIntent.id} amount=${paymentIntent.amount / 100} ${paymentIntent.currency}`)
 
-    // latest_charge is a string ID when not expanded
+    // Resolve charge and card details up front
     const chargeId =
       typeof paymentIntent.latest_charge === 'string'
         ? paymentIntent.latest_charge
-        : (paymentIntent.latest_charge as Stripe.Charge | null)?.id ?? null
+        : (paymentIntent.latest_charge as Stripe.Charge | null)?.id ?? piAny.charges?.data?.[0]?.id ?? null
 
-    let cardDetails: {
-      brand?: string
-      last4?: string
-      expMonth?: number
-      expYear?: number
-    } | null = null
+    let cardBrand: string | undefined
+    let cardLast4: string | undefined
+    let cardExpMonth: number | undefined
+    let cardExpYear: number | undefined
+    let paymentMethod: string | undefined
 
-    // Retrieve the charge to get card details (one API call, avoids expand depth limits)
     if (chargeId) {
       try {
         const charge = await this.stripe.charges.retrieve(chargeId)
-        const card = charge.payment_method_details?.card
-        if (card) {
-          cardDetails = {
-            brand: card.brand ?? undefined,
-            last4: card.last4 ?? undefined,
-            expMonth: card.exp_month ?? undefined,
-            expYear: card.exp_year ?? undefined,
-          }
-        }
+        paymentMethod = charge.payment_method_details?.type ?? undefined
+        cardBrand = charge.payment_method_details?.card?.brand ?? undefined
+        cardLast4 = charge.payment_method_details?.card?.last4 ?? undefined
+        cardExpMonth = charge.payment_method_details?.card?.exp_month ?? undefined
+        cardExpYear = charge.payment_method_details?.card?.exp_year ?? undefined
       } catch (error) {
-        this.logger.warn(`Could not retrieve charge ${chargeId} for card details: ${error.message}`)
+        this.logger.warn(`Could not retrieve charge ${chargeId}: ${error.message}`)
       }
     }
 
-    const result = await this.prisma.payment.updateMany({
+    const cardData = {
+      ...(chargeId && { stripeChargeId: chargeId }),
+      paymentMethod: paymentMethod ?? paymentIntent.payment_method_types?.[0] ?? null,
+      cardBrand: cardBrand ?? null,
+      cardLast4: cardLast4 ?? null,
+      cardExpMonth: cardExpMonth ?? null,
+      cardExpYear: cardExpYear ?? null,
+    }
+
+    // ── Case 1: Payment row already exists (normal path — invoice.finalized ran first) ──
+    const existingPayment = await this.prisma.payment.findUnique({
       where: { stripePaymentIntentId: paymentIntent.id },
-      data: {
-        status: 'SUCCEEDED',
-        paidAt: new Date(),
-        ...(chargeId && { stripeChargeId: chargeId }),
-        paymentMethod: paymentIntent.payment_method_types?.[0] ?? null,
-        ...(cardDetails && {
-          cardBrand: cardDetails.brand ?? null,
-          cardLast4: cardDetails.last4 ?? null,
-          cardExpMonth: cardDetails.expMonth ?? null,
-          cardExpYear: cardDetails.expYear ?? null,
-        }),
-      },
     })
 
-    if (result.count === 0) {
-      this.logger.warn(
-        `[PI_SUCCEEDED] No Payment row found for paymentIntentId=${paymentIntent.id} — ` +
-        `invoice.finalized fired before the PI was attached to the invoice. Creating Payment record now.`,
-      )
-      // The PI wasn't on the invoice when invoice.finalized ran, so no Payment row was created.
-      // PaymentIntents for invoice payments carry an `invoice` field — use it to find our DB invoice.
-      await this.createMissingPaymentRecord(paymentIntent, chargeId, cardDetails)
-    } else {
-      this.logger.log(`[PI_SUCCEEDED] Updated ${result.count} Payment(s) to SUCCEEDED for paymentIntentId=${paymentIntent.id}`)
+    if (existingPayment) {
+      await this.prisma.payment.update({
+        where: { id: existingPayment.id },
+        data: { status: 'SUCCEEDED', paidAt: new Date(), ...cardData },
+      })
+      await this.prisma.subscriptionHistory.create({
+        data: {
+          subscriptionId: existingPayment.subscriptionId,
+          eventType: SubscriptionEventType.PAYMENT_SUCCEEDED,
+          description: `Payment succeeded: ${existingPayment.amount} ${paymentIntent.currency.toUpperCase()}`,
+        },
+      })
+      this.logger.log(`[PI_SUCCEEDED] Updated existing Payment to SUCCEEDED for paymentIntentId=${paymentIntent.id}`)
+      return
     }
-  }
 
-  /**
-   * Called when payment_intent.succeeded arrives but no Payment row exists yet.
-   * This happens when invoice.finalized fired before Stripe attached the payment intent
-   * to the invoice object, so handleInvoiceFinalized had no paymentIntentId to work with.
-   */
-  private async createMissingPaymentRecord(
-    paymentIntent: Stripe.PaymentIntent,
-    chargeId: string | null,
-    cardDetails: { brand?: string; last4?: string; expMonth?: number; expYear?: number } | null,
-  ) {
-    // PaymentIntents created for invoices carry the invoice ID
-    const stripeInvoiceId =
-      typeof (paymentIntent as any).invoice === 'string'
-        ? (paymentIntent as any).invoice
-        : (paymentIntent as any).invoice?.id ?? null
+    // ── Case 2: No Payment row (invoice.finalized had no PI yet — create it now) ──
+    this.logger.warn(
+      `[PI_SUCCEEDED] No Payment row for paymentIntentId=${paymentIntent.id} — ` +
+      `invoice.finalized fired before PI was attached. Creating now.`,
+    )
 
-    this.logger.log(`[PI_SUCCEEDED] Fallback create — stripeInvoiceId=${stripeInvoiceId ?? 'none'}`)
+    // Resolve the subscription: invoice field on PI → customer fallback
+    const stripeInvoiceId = typeof piAny.invoice === 'string' ? piAny.invoice : piAny.invoice?.id ?? null
+    const customerId =
+      typeof paymentIntent.customer === 'string'
+        ? paymentIntent.customer
+        : (paymentIntent.customer as Stripe.Customer | null)?.id ?? null
 
-    let invoiceRecord: { id: string; subscriptionId: string } | null = null
+    let subscription: { id: string; status: string } | null = null
 
     if (stripeInvoiceId) {
-      invoiceRecord = await this.prisma.invoice.findUnique({
-        where: { stripeInvoiceId },
-        select: { id: true, subscriptionId: true },
+      try {
+        const stripeInvoice = await this.stripe.invoices.retrieve(stripeInvoiceId)
+        const subId = extractSubscriptionIdFromInvoice(stripeInvoice)
+        if (subId) {
+          subscription = await this.prisma.subscription.findUnique({
+            where: { stripeSubscriptionId: subId },
+            select: { id: true, status: true },
+          })
+        }
+      } catch (err) {
+        this.logger.warn(`Could not retrieve invoice ${stripeInvoiceId}: ${err.message}`)
+      }
+    }
+
+    if (!subscription && customerId) {
+      subscription = await this.prisma.subscription.findUnique({
+        where: { stripeCustomerId: customerId },
+        select: { id: true, status: true },
       })
     }
 
-    // If we still can't find the invoice, fall back to customer → subscription lookup
-    if (!invoiceRecord) {
-      this.logger.warn(`[PI_SUCCEEDED] Invoice ${stripeInvoiceId ?? 'unknown'} not in DB — falling back to customer lookup`)
-      const customerId =
-        typeof paymentIntent.customer === 'string'
-          ? paymentIntent.customer
-          : (paymentIntent.customer as Stripe.Customer | null)?.id ?? null
-
-      if (customerId) {
-        const sub = await this.prisma.subscription.findUnique({
-          where: { stripeCustomerId: customerId },
-          select: { id: true },
-        })
-        if (sub) {
-          // Find the most recent open invoice for this subscription (no payment linked yet)
-          const latestInvoice = await this.prisma.invoice.findFirst({
-            where: { subscriptionId: sub.id },
-            orderBy: { invoiceDate: 'desc' },
-            select: { id: true, subscriptionId: true },
-          })
-          invoiceRecord = latestInvoice
-        }
-      }
-    }
-
-    if (!invoiceRecord) {
+    if (!subscription) {
       this.logger.error(
-        `[PI_SUCCEEDED] Cannot create Payment record — no invoice or subscription found for paymentIntentId=${paymentIntent.id}`,
+        `[PI_SUCCEEDED] Cannot create Payment — no subscription found for paymentIntentId=${paymentIntent.id}`,
       )
       return
     }
 
-    await this.prisma.payment.upsert({
-      where: { stripePaymentIntentId: paymentIntent.id },
-      create: {
-        subscriptionId: invoiceRecord.subscriptionId,
-        invoiceId: invoiceRecord.id,
-        stripePaymentIntentId: paymentIntent.id,
-        status: 'SUCCEEDED',
-        amount: paymentIntent.amount / 100,
-        currency: paymentIntent.currency,
-        paidAt: new Date(),
-        ...(chargeId && { stripeChargeId: chargeId }),
-        paymentMethod: paymentIntent.payment_method_types?.[0] ?? null,
-        ...(cardDetails && {
-          cardBrand: cardDetails.brand ?? null,
-          cardLast4: cardDetails.last4 ?? null,
-          cardExpMonth: cardDetails.expMonth ?? null,
-          cardExpYear: cardDetails.expYear ?? null,
-        }),
-      },
-      update: {
-        status: 'SUCCEEDED',
-        paidAt: new Date(),
-        invoiceId: invoiceRecord.id,
-        ...(chargeId && { stripeChargeId: chargeId }),
-        paymentMethod: paymentIntent.payment_method_types?.[0] ?? null,
-        ...(cardDetails && {
-          cardBrand: cardDetails.brand ?? null,
-          cardLast4: cardDetails.last4 ?? null,
-          cardExpMonth: cardDetails.expMonth ?? null,
-          cardExpYear: cardDetails.expYear ?? null,
-        }),
+    // Create (or update) the Payment in a transaction, linking to invoice if available
+    const createdPayment = await this.prisma.$transaction(async (tx) => {
+      // Guard against duplicate (another webhook delivery may have raced us)
+      const duplicate = await tx.payment.findUnique({ where: { stripePaymentIntentId: paymentIntent.id } })
+
+      // Try to find matching invoice by stripeInvoiceId first, then recent orphan
+      let invoiceDbId: string | undefined
+      if (stripeInvoiceId) {
+        const inv = await tx.invoice.findUnique({ where: { stripeInvoiceId }, select: { id: true } })
+        if (inv) invoiceDbId = inv.id
+      }
+      if (!invoiceDbId) {
+        const orphan = await tx.invoice.findFirst({
+          where: { subscriptionId: subscription.id, createdAt: { gte: new Date(Date.now() - 60_000) } },
+          orderBy: { createdAt: 'desc' },
+          select: { id: true },
+        })
+        if (orphan) invoiceDbId = orphan.id
+      }
+
+      if (duplicate) {
+        return tx.payment.update({
+          where: { stripePaymentIntentId: paymentIntent.id },
+          data: { status: 'SUCCEEDED', paidAt: new Date(), invoiceId: invoiceDbId, ...cardData },
+        })
+      }
+
+      return tx.payment.create({
+        data: {
+          subscriptionId: subscription.id,
+          invoiceId: invoiceDbId,
+          stripePaymentIntentId: paymentIntent.id,
+          status: 'SUCCEEDED',
+          amount: paymentIntent.amount / 100,
+          currency: paymentIntent.currency,
+          paidAt: new Date(),
+          ...cardData,
+        },
+      })
+    })
+
+    await this.prisma.subscriptionHistory.create({
+      data: {
+        subscriptionId: subscription.id,
+        eventType: SubscriptionEventType.PAYMENT_SUCCEEDED,
+        description: `Payment succeeded: ${createdPayment.amount} ${paymentIntent.currency.toUpperCase()}`,
       },
     })
 
-    this.logger.log(
-      `[PI_SUCCEEDED] Created missing Payment record for paymentIntentId=${paymentIntent.id} linked to invoiceId=${invoiceRecord.id}`,
-    )
+    this.logger.log(`[PI_SUCCEEDED] Created Payment record for paymentIntentId=${paymentIntent.id}`)
   }
 
   /** payment_intent.payment_failed */

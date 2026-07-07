@@ -1,9 +1,29 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { createCanvas } from 'canvas'
+import type { Canvas } from 'canvas'
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf'
 
-const THUMBNAIL_SCALE = 0.5   // renders at 50% of original — good balance of quality vs size
+// 3× the native PDF resolution (72dpi × 3 = 216dpi) — crisp on retina displays
+const THUMBNAIL_SCALE = 3.0
 const THUMBNAIL_CONTENT_TYPE = 'image/png'
+
+// pdfjs-dist needs a canvas factory in Node.js to render images embedded in PDFs
+class NodeCanvasFactory {
+  create(width: number, height: number) {
+    const canvas = createCanvas(width, height)
+    return { canvas, context: canvas.getContext('2d') }
+  }
+
+  reset(canvasAndContext: { canvas: Canvas }, width: number, height: number) {
+    canvasAndContext.canvas.width = width
+    canvasAndContext.canvas.height = height
+  }
+
+  destroy(canvasAndContext: { canvas: Canvas }) {
+    canvasAndContext.canvas.width = 0
+    canvasAndContext.canvas.height = 0
+  }
+}
 
 @Injectable()
 export class ThumbnailService {
@@ -11,10 +31,11 @@ export class ThumbnailService {
 
   async generateFromPdfBuffer(pdfBuffer: Buffer): Promise<Buffer> {
     const data = new Uint8Array(pdfBuffer)
+    const canvasFactory = new NodeCanvasFactory()
 
     const doc = await pdfjs.getDocument({
       data,
-      // Disable worker in Node.js — runs in main thread
+      canvasFactory,
       isEvalSupported: false,
       useSystemFonts: true,
     }).promise

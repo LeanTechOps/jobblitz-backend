@@ -131,11 +131,11 @@ export class ResumeService {
     return updated
   }
 
-  /** Returns resume list with metadata only — no presigned URLs generated here */
+  /** Returns resume list with thumbnail presigned URLs — thumbnails are small so eager is fine */
   async listResumes(userId: string) {
     const profile = await this.getProfile(userId)
 
-    return this.prisma.resume.findMany({
+    const resumes = await this.prisma.resume.findMany({
       where: { profileId: profile.id },
       orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }],
       select: {
@@ -148,20 +148,22 @@ export class ResumeService {
         createdAt: true,
       },
     })
+
+    return Promise.all(
+      resumes.map(async (r) => ({
+        ...r,
+        thumbnailUrl: r.thumbnailKey
+          ? await this.s3.getPresignedDownloadUrl(r.thumbnailKey)
+          : null,
+      })),
+    )
   }
 
-  /** Lazy URL fetch — called only when user needs to view/download a specific resume */
+  /** Lazy — only called when user clicks download. Generates presigned PDF download URL on demand. */
   async getResumeUrls(userId: string, resumeId: string) {
     const resume = await this.assertOwnership(userId, resumeId)
-
-    const [downloadUrl, thumbnailUrl] = await Promise.all([
-      this.s3.getPresignedDownloadUrl(resume.key),
-      resume.thumbnailKey
-        ? this.s3.getPresignedDownloadUrl(resume.thumbnailKey)
-        : Promise.resolve(null),
-    ])
-
-    return { downloadUrl, thumbnailUrl }
+    const downloadUrl = await this.s3.getPresignedDownloadUrl(resume.key)
+    return { downloadUrl }
   }
 
   async setDefault(userId: string, resumeId: string) {
