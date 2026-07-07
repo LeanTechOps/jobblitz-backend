@@ -26,9 +26,8 @@ export function mapStripePlanToPrisma(
 
   const planMap: Record<string, SubscriptionPlan> = {
     FREE: SubscriptionPlan.FREE,
-    STARTER: SubscriptionPlan.STARTER,
     PRO: SubscriptionPlan.PRO,
-    BLITZ: SubscriptionPlan.BLITZ,
+    BUSINESS: SubscriptionPlan.BUSINESS,
   }
 
   return planMap[planKey] ?? fallbackPlan ?? null

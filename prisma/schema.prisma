@@ -185,9 +185,8 @@ enum SubscriptionStatus {
 
 enum SubscriptionPlan {
   FREE
-  STARTER
   PRO
-  BLITZ
+  BUSINESS
 }
 
 enum BillingCycle {

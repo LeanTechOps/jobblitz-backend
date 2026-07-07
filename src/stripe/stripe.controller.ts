@@ -3,7 +3,6 @@ import {
   Get,
   Post,
   Body,
-  UseGuards,
   Request,
   BadRequestException,
   Headers,
@@ -13,7 +12,6 @@ import {
 import { StripeService } from './stripe.service'
 import { StripeWebhookService } from './stripe-webhook.service'
 import { BillingService } from './billing.service'
-import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard'
 import { CreateCheckoutDto } from './dto/create-checkout.dto'
 import { Public } from '../auth/decorator/public.decorator'
 
@@ -32,25 +30,21 @@ export class StripeController {
   }
 
   @Get('subscription-status')
-  @UseGuards(JwtAuthGuard)
   async getSubscriptionStatus(@Request() req) {
     return this.stripeService.getSubscriptionStatus(req.user.id)
   }
 
   @Get('billing-info')
-  @UseGuards(JwtAuthGuard)
   async getBillingInfo(@Request() req) {
     return this.billingService.getBillingInfo(req.user.id)
   }
 
   @Get('estimated-costs')
-  @UseGuards(JwtAuthGuard)
   async getEstimatedCosts(@Request() req) {
     return this.billingService.getEstimatedCosts(req.user.id)
   }
 
   @Post('create-subscription-session')
-  @UseGuards(JwtAuthGuard)
   async createSubscriptionSession(@Body() dto: CreateCheckoutDto, @Request() req) {
     return this.stripeService.createSubscriptionSession(req.user.id, dto.stripePriceId, dto.flowType)
   }
