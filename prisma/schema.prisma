@@ -1,0 +1,229 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ============================================
+// USER & AUTH
+// ============================================
+
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique @db.VarChar(255)
+  firstName     String?        @db.VarChar(255)
+  lastName      String?        @db.VarChar(255)
+  avatar        String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  authProviders AuthProvider[]
+  subscription  Subscription?
+}
+
+model AuthProvider {
+  id           String       @id @default(uuid())
+  userId       String
+  provider     ProviderEnum
+  providerId   String
+  accessToken  String?      @db.Text
+  refreshToken String?      @db.Text
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerId])
+}
+
+// ============================================
+// SUBSCRIPTION SYSTEM
+// ============================================
+
+model Subscription {
+  id                   String              @id @default(uuid())
+  userId               String              @unique
+  user                 User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stripeCustomerId     String?             @unique
+  stripeSubscriptionId String?             @unique
+  status               SubscriptionStatus  @default(ACTIVE)
+  plan                 SubscriptionPlan    @default(FREE)
+  billingCycle         BillingCycle        @default(MONTHLY)
+  subscriptionStartedAt DateTime?
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  cancelAt             DateTime?
+  cancelAtPeriodEnd    Boolean             @default(false)
+  currentPrice         Decimal?            @db.Decimal(10, 2)
+  currency             String              @default("usd") @db.VarChar(3)
+  metadata             Json?
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  invoices             Invoice[]
+  payments             Payment[]
+  subscriptionHistory  SubscriptionHistory[]
+
+  @@index([status])
+  @@index([stripeCustomerId])
+  @@index([stripeSubscriptionId])
+}
+
+model SubscriptionHistory {
+  id             String                @id @default(uuid())
+  subscriptionId String
+  subscription   Subscription          @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  eventType      SubscriptionEventType
+  oldStatus      SubscriptionStatus?
+  newStatus      SubscriptionStatus?
+  oldPlan        SubscriptionPlan?
+  newPlan        SubscriptionPlan?
+  description    String?               @db.Text
+  metadata       Json?
+  createdAt      DateTime              @default(now())
+
+  @@index([subscriptionId])
+  @@index([eventType])
+  @@index([createdAt])
+}
+
+model Invoice {
+  id                String        @id @default(uuid())
+  subscriptionId    String
+  subscription      Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  stripeInvoiceId   String        @unique
+  stripeHostedUrl   String?       @db.Text
+  stripePdfUrl      String?       @db.Text
+  status            InvoiceStatus @default(DRAFT)
+  amountDue         Decimal       @db.Decimal(10, 2)
+  amountPaid        Decimal       @default(0) @db.Decimal(10, 2)
+  amountRemaining   Decimal       @db.Decimal(10, 2)
+  currency          String        @default("usd") @db.VarChar(3)
+  invoiceDate       DateTime
+  dueDate           DateTime?
+  paidAt            DateTime?
+  periodStart       DateTime?
+  periodEnd         DateTime?
+  description       String?       @db.Text
+  metadata          Json?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  payments          Payment[]
+
+  @@index([subscriptionId])
+  @@index([stripeInvoiceId])
+  @@index([status])
+  @@index([invoiceDate])
+}
+
+model Payment {
+  id                    String        @id @default(uuid())
+  subscriptionId        String
+  subscription          Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  invoiceId             String?
+  invoice               Invoice?      @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  stripePaymentIntentId String?       @unique
+  stripeChargeId        String?       @unique
+  status                PaymentStatus @default(PENDING)
+  amount                Decimal       @db.Decimal(10, 2)
+  currency              String        @default("usd") @db.VarChar(3)
+  paymentMethod         String?       @db.VarChar(50)
+  cardBrand             String?       @db.VarChar(50)
+  cardLast4             String?       @db.VarChar(4)
+  cardExpMonth          Int?
+  cardExpYear           Int?
+  failureReason         String?       @db.Text
+  failureCode           String?       @db.VarChar(100)
+  retriedCount          Int           @default(0)
+  paidAt                DateTime?
+  failedAt              DateTime?
+  metadata              Json?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  @@index([subscriptionId])
+  @@index([invoiceId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model StripeWebhookEvent {
+  id              String    @id @default(uuid())
+  stripeEventId   String    @unique
+  eventType       String    @db.VarChar(255)
+  apiVersion      String?   @db.VarChar(50)
+  data            Json
+  processed       Boolean   @default(false)
+  processedAt     DateTime?
+  processingError String?   @db.Text
+  retryCount      Int       @default(0)
+  createdAt       DateTime  @default(now())
+
+  @@index([stripeEventId])
+  @@index([processed])
+  @@index([eventType])
+  @@index([createdAt])
+}
+
+// ============================================
+// ENUMS
+// ============================================
+
+enum ProviderEnum {
+  GOOGLE
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+  PAUSED
+  UNPAID
+}
+
+enum SubscriptionPlan {
+  FREE
+  STARTER
+  PRO
+  BLITZ
+}
+
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+  QUARTERLY
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  CANCELED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum SubscriptionEventType {
+  SUBSCRIBED
+  PLAN_UPGRADED
+  PLAN_DOWNGRADED
+  PAYMENT_SUCCEEDED
+  PAYMENT_FAILED
+  PAYMENT_REFUNDED
+  SUBSCRIPTION_RENEWED
+  SUBSCRIPTION_CANCELED
+  SUBSCRIPTION_REACTIVATED
+  SUBSCRIPTION_PAUSED
+  SUBSCRIPTION_RESUMED
+}

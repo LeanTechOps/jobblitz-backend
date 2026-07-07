@@ -1,0 +1,365 @@
+import { Injectable, BadRequestException, Logger } from '@nestjs/common'
+import { ConfigService } from '@nestjs/config'
+import { SubscriptionPlan } from '@prisma/client'
+import Stripe from 'stripe'
+import { PrismaService } from '../prisma/prisma.service'
+import { PricingPlan } from './dto/pricing.dto'
+import { PRICING_FEATURES } from './pricing-features.config'
+import {
+  mapStripeStatus,
+  mapStripePlanToPrisma,
+  resolveStripeCustomer,
+} from './utils/stripe.utils'
+
+const TRIAL_PERIOD_DAYS = 15
+
+@Injectable()
+export class StripeService {
+  private stripe: Stripe
+  private readonly logger = new Logger(StripeService.name)
+
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly prisma: PrismaService,
+  ) {
+    const apiKey = this.configService.get<string>('STRIPE_SECRET_KEY')
+    if (!apiKey) throw new Error('STRIPE_SECRET_KEY not configured')
+
+    this.stripe = new Stripe(apiKey, {
+      apiVersion: '2025-12-15.clover' as any,
+    })
+  }
+
+  // ─── Trial setup (called at signup) ────────────────────────────────────────
+
+  /**
+   * Creates a Stripe customer (find-or-create by email) and a FREE-plan trial
+   * subscription with trial_period_days=15. Stripe will fire
+   * customer.subscription.updated when the trial transitions to active,
+   * giving us automatic expiry handling via webhooks.
+   *
+   * If a subscription already exists for this customer (re-login case), we
+   * sync it to DB and return without creating a duplicate.
+   */
+  async createTrialSubscription(
+    userId: string,
+    email: string,
+    name?: string,
+  ): Promise<{ stripeCustomerId: string; stripeSubscriptionId: string }> {
+    // 1. Find or create Stripe customer by email
+    const customerId = await resolveStripeCustomer(this.stripe, this.prisma, {
+      userId,
+      email,
+      name,
+      logPrefix: '[TRIAL] ',
+      logger: this.logger,
+    })
+
+    // 2. Check if this customer already has a Stripe subscription (re-login / env re-use)
+    const existing = await this.stripe.subscriptions.list({
+      customer: customerId,
+      limit: 1,
+      expand: ['data.items.data.price'],
+    })
+
+    if (existing.data.length > 0) {
+      const sub = existing.data[0]
+      this.logger.warn(
+        `[TRIAL] Customer ${customerId} already has subscription ${sub.id} (${sub.status}) — syncing to DB`,
+      )
+
+      // Ensure metadata carries userId so future webhooks can look up the record
+      if (sub.metadata?.userId !== userId) {
+        try {
+          await this.stripe.subscriptions.update(sub.id, { metadata: { userId } })
+        } catch (err) {
+          this.logger.warn(`[TRIAL] Could not update subscription metadata: ${err.message}`)
+        }
+      }
+
+      const productId = sub.items.data[0]?.price?.product as string | undefined
+      let planKey: string | undefined
+      if (productId) {
+        try {
+          const product = await this.stripe.products.retrieve(productId)
+          planKey = product.name?.toUpperCase()
+        } catch (err) {
+          this.logger.warn(`[TRIAL] Could not retrieve product ${productId}: ${err.message}`)
+        }
+      }
+
+      const subAny = sub as any
+      const plan = mapStripePlanToPrisma(planKey) ?? SubscriptionPlan.FREE
+      const interval = sub.items.data[0]?.price?.recurring?.interval
+      const billingCycle: 'MONTHLY' | 'YEARLY' = interval === 'year' ? 'YEARLY' : 'MONTHLY'
+      const trialEnd: number | null = subAny.trial_end ?? null
+
+      await this.prisma.subscription.update({
+        where: { userId },
+        data: {
+          stripeSubscriptionId: sub.id,
+          stripeCustomerId: customerId,
+          plan,
+          status: mapStripeStatus(sub.status),
+          billingCycle,
+          currentPeriodStart: subAny.current_period_start
+            ? new Date(subAny.current_period_start * 1000)
+            : null,
+          currentPeriodEnd: trialEnd
+            ? new Date(trialEnd * 1000)
+            : subAny.current_period_end
+              ? new Date(subAny.current_period_end * 1000)
+              : null,
+          currentPrice: (sub.items.data[0]?.price?.unit_amount ?? 0) / 100,
+          cancelAt: subAny.cancel_at ? new Date(subAny.cancel_at * 1000) : null,
+          cancelAtPeriodEnd: sub.cancel_at_period_end,
+        },
+      })
+
+      return { stripeCustomerId: customerId, stripeSubscriptionId: sub.id }
+    }
+
+    // 3. Find the FREE price (unit_amount = 0) in Stripe
+    const prices = await this.stripe.prices.list({ active: true, expand: ['data.product'] })
+    const freePrice = prices.data.find((p) => {
+      const product = p.product as Stripe.Product
+      return product?.name?.toUpperCase() === 'FREE' && p.unit_amount === 0
+    })
+
+    if (!freePrice) {
+      this.logger.warn(
+        '[TRIAL] FREE price not found in Stripe — trial tracked by DB dates only. ' +
+          'Create a FREE product (price = $0/month) in your Stripe dashboard to enable automatic expiry.',
+      )
+      // Fall back to DB-only trial (no automatic Stripe expiry)
+      const trialEndsAt = new Date()
+      trialEndsAt.setDate(trialEndsAt.getDate() + TRIAL_PERIOD_DAYS)
+      await this.prisma.subscription.update({
+        where: { userId },
+        data: {
+          stripeCustomerId: customerId,
+          currentPeriodStart: new Date(),
+          currentPeriodEnd: trialEndsAt,
+        },
+      })
+      return { stripeCustomerId: customerId, stripeSubscriptionId: '' }
+    }
+
+    // 4. Create the trial subscription on the FREE product
+    this.logger.log(`[TRIAL] Creating ${TRIAL_PERIOD_DAYS}-day trial subscription for user ${userId}`)
+
+    const stripeSub = await this.stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: freePrice.id }],
+      trial_period_days: TRIAL_PERIOD_DAYS,
+      payment_behavior: 'default_incomplete',
+      metadata: { userId },
+    })
+
+    const subAny = stripeSub as any
+    const trialEnd: number | null = subAny.trial_end ?? null
+
+    this.logger.log(
+      `[TRIAL] Subscription ${stripeSub.id} created — status=${stripeSub.status}, trial_end=${trialEnd}`,
+    )
+
+    // 5. Persist IDs and trial period to DB
+    await this.prisma.subscription.update({
+      where: { userId },
+      data: {
+        stripeSubscriptionId: stripeSub.id,
+        stripeCustomerId: customerId,
+        currentPeriodStart: new Date(),
+        currentPeriodEnd: trialEnd ? new Date(trialEnd * 1000) : null,
+      },
+    })
+
+    return { stripeCustomerId: customerId, stripeSubscriptionId: stripeSub.id }
+  }
+
+  async getPricingPlans(): Promise<PricingPlan[]> {
+    try {
+      const prices = await this.stripe.prices.list({
+        active: true,
+        expand: ['data.product'],
+      })
+
+      const plans: PricingPlan[] = []
+
+      for (const price of prices.data) {
+        const product = price.product as Stripe.Product
+        const planName = product?.name
+        const planKey = planName?.toUpperCase()
+        const planConfig = PRICING_FEATURES[planKey]
+
+        if (!planConfig) continue
+
+        plans.push({
+          id: planKey.toLowerCase(),
+          name: planName,
+          description: product.description || `${planName} plan`,
+          price: (price.unit_amount || 0) / 100,
+          currency: price.currency,
+          interval: price.recurring?.interval || 'month',
+          stripePriceId: price.id,
+          stripeProductId: product.id,
+          popular: planConfig.popular,
+          features: planConfig.features,
+        })
+      }
+
+      plans.sort((a, b) => a.price - b.price)
+      return plans
+    } catch (error) {
+      this.logger.error('Error fetching pricing from Stripe:', error)
+      throw new BadRequestException('Failed to fetch pricing plans')
+    }
+  }
+
+  async createCheckoutSessionByPriceId(
+    userId: string,
+    stripePriceId: string,
+  ): Promise<Stripe.Checkout.Session> {
+    try {
+      const subscription = await this.prisma.subscription.findUnique({
+        where: { userId },
+        select: {
+          stripeCustomerId: true,
+          user: {
+            select: {
+              email: true,
+              firstName: true,
+              lastName: true,
+            },
+          },
+        },
+      })
+
+      if (!subscription) throw new BadRequestException('No subscription found')
+
+      const userName = [subscription.user.firstName, subscription.user.lastName]
+        .filter(Boolean)
+        .join(' ')
+
+      let customerId = subscription.stripeCustomerId
+
+      if (!customerId) {
+        customerId = await resolveStripeCustomer(this.stripe, this.prisma, {
+          userId,
+          email: subscription.user.email,
+          name: userName || undefined,
+          logger: this.logger,
+        })
+      }
+
+      const frontendUrl = this.configService.get<string>('FRONTEND_URL', 'http://localhost:4000')
+
+      const session = await this.stripe.checkout.sessions.create({
+        customer: customerId,
+        mode: 'subscription',
+        payment_method_types: ['card'],
+        line_items: [{ price: stripePriceId, quantity: 1 }],
+        automatic_tax: { enabled: true },
+        customer_update: { address: 'auto' },
+        success_url: `${frontendUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${frontendUrl}/pricing`,
+        subscription_data: { metadata: { userId } },
+        metadata: { userId },
+      })
+
+      return session
+    } catch (error) {
+      this.logger.error('Error creating checkout session:', error)
+      if (error instanceof BadRequestException) throw error
+      throw new BadRequestException('Failed to create checkout session')
+    }
+  }
+
+  async createSubscriptionSession(
+    userId: string,
+    stripePriceId?: string,
+    flowType?: 'subscription_update',
+  ): Promise<{ url: string; type: 'checkout' | 'portal' }> {
+    const subscription = await this.prisma.subscription.findUnique({
+      where: { userId },
+      select: {
+        stripeCustomerId: true,
+        stripeSubscriptionId: true,
+        plan: true,
+        status: true,
+      },
+    })
+
+    if (!subscription) throw new BadRequestException('No subscription found')
+
+    // Use checkout for: FREE plan users who have no active Stripe subscription.
+    // This covers both fresh FREE users and users whose trial ended without subscribing.
+    const isActivePaidSub =
+      subscription.plan !== SubscriptionPlan.FREE && !!subscription.stripeSubscriptionId
+
+    if (!isActivePaidSub) {
+      if (!stripePriceId) throw new BadRequestException('Price ID required for new subscriptions')
+      const session = await this.createCheckoutSessionByPriceId(userId, stripePriceId)
+      return { url: session.url ?? '', type: 'checkout' }
+    }
+
+    if (!subscription.stripeCustomerId) throw new BadRequestException('No Stripe customer found')
+
+    const portalSession = await this.createPortalSession(
+      subscription.stripeCustomerId,
+      subscription.stripeSubscriptionId,
+      flowType,
+    )
+    return { url: portalSession.url, type: 'portal' }
+  }
+
+  async createPortalSession(
+    stripeCustomerId: string,
+    stripeSubscriptionId: string | null,
+    flowType?: 'subscription_update',
+  ): Promise<{ url: string }> {
+    const frontendUrl = this.configService.get<string>('FRONTEND_URL', 'http://localhost:4000')
+
+    const config: Stripe.BillingPortal.SessionCreateParams = {
+      customer: stripeCustomerId,
+      return_url: `${frontendUrl}/dashboard`,
+    }
+
+    if (flowType === 'subscription_update' && stripeSubscriptionId) {
+      config.flow_data = {
+        type: 'subscription_update',
+        subscription_update: { subscription: stripeSubscriptionId },
+      }
+    }
+
+    const session = await this.stripe.billingPortal.sessions.create(config)
+    return { url: session.url }
+  }
+
+  async getSubscriptionStatus(userId: string) {
+    const subscription = await this.prisma.subscription.findUnique({
+      where: { userId },
+      select: {
+        id: true,
+        plan: true,
+        status: true,
+        currentPeriodEnd: true,
+        stripeCustomerId: true,
+        billingCycle: true,
+        cancelAtPeriodEnd: true,
+      },
+    })
+
+    if (!subscription) return null
+
+    return {
+      id: subscription.id,
+      plan: subscription.plan,
+      status: subscription.status,
+      currentPeriodEnd: subscription.currentPeriodEnd,
+      stripeCustomerId: subscription.stripeCustomerId,
+      billingCycle: subscription.billingCycle,
+      cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
+    }
+  }
+}
