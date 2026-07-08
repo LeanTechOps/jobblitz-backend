@@ -1,5 +1,5 @@
-import { IsOptional, IsString, IsEnum, IsInt, Min } from 'class-validator'
-import { Type } from 'class-transformer'
+import { IsOptional, IsString, IsEnum, IsInt, IsArray, Min } from 'class-validator'
+import { Type, Transform } from 'class-transformer'
 import { SubscriptionPlan, VisaType } from '@prisma/client'
 
 export class ListUsersDto {
@@ -7,9 +7,12 @@ export class ListUsersDto {
   @IsString()
   search?: string
 
+  // Accepts ?skills=react&skills=typescript  OR a single ?skills=react
   @IsOptional()
-  @IsString()
-  skill?: string
+  @Transform(({ value }) => (Array.isArray(value) ? value : value ? [value] : undefined))
+  @IsArray()
+  @IsString({ each: true })
+  skills?: string[]
 
   @IsOptional()
   @IsEnum(VisaType)

@@ -1,14 +1,34 @@
 import { Injectable, NotFoundException } from '@nestjs/common'
 import { Prisma, SubscriptionPlan } from '@prisma/client'
 import { PrismaService } from 'src/prisma/prisma.service'
+import { S3Service } from 'src/s3/s3.service'
 import { ListUsersDto } from './dto/list-users.dto'
 
 @Injectable()
 export class AdminService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly s3: S3Service,
+  ) {}
+
+  async getResumeDownloadUrl(resumeId: string) {
+    const resume = await this.prisma.resume.findUnique({ where: { id: resumeId } })
+    if (!resume) throw new NotFoundException('Resume not found')
+    const downloadUrl = await this.s3.getPresignedDownloadUrl(resume.key)
+    return { downloadUrl, fileName: resume.originalName }
+  }
+
+  async getDistinctSkills(): Promise<string[]> {
+    const profiles = await this.prisma.profile.findMany({
+      where: { skills: { isEmpty: false } },
+      select: { skills: true },
+    })
+    const all = profiles.flatMap((p) => p.skills)
+    return [...new Set(all)].sort((a, b) => a.localeCompare(b))
+  }
 
   async listUsers(query: ListUsersDto) {
-    const { page = 1, limit = 20, search, skill, visaType, plan } = query
+    const { page = 1, limit = 20, search, skills, visaType, plan } = query
     const skip = (page - 1) * limit
 
     const where: Prisma.UserWhereInput = {
@@ -21,7 +41,7 @@ export class AdminService {
       }),
       ...(plan && { subscription: { plan } }),
       profile: {
-        ...(skill && { skills: { has: skill } }),
+        ...(skills?.length && { skills: { hasSome: skills } }),
         ...(visaType && { visaType }),
       },
     }

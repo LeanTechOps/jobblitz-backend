@@ -13,6 +13,16 @@ export class AdminController {
     return this.adminService.getDashboardStats()
   }
 
+  @Get('skills')
+  getDistinctSkills() {
+    return this.adminService.getDistinctSkills()
+  }
+
+  @Get('resumes/:resumeId/url')
+  getResumeDownloadUrl(@Param('resumeId') resumeId: string) {
+    return this.adminService.getResumeDownloadUrl(resumeId)
+  }
+
   @Get('users')
   listUsers(@Query() query: ListUsersDto) {
     return this.adminService.listUsers(query)
