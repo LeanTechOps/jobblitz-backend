@@ -109,7 +109,7 @@ export class AdminService {
             visaType: true,
             skills: true,
             resumes: {
-              select: { id: true, originalName: true, label: true, isDefault: true, createdAt: true, thumbnailKey: true },
+              select: { id: true, key: true, originalName: true, label: true, isDefault: true, createdAt: true, thumbnailKey: true },
               orderBy: { createdAt: 'desc' },
             },
           },
@@ -119,13 +119,16 @@ export class AdminService {
 
     if (!user) throw new NotFoundException('User not found')
 
-    // Attach presigned thumbnail URLs for resumes
+    // Attach presigned URLs (thumbnail + download) for resumes
     const resumesWithUrls = user.profile
       ? await Promise.all(
-          user.profile.resumes.map(async (r) => ({
-            ...r,
-            thumbnailUrl: r.thumbnailKey ? await this.s3.getPresignedDownloadUrl(r.thumbnailKey, 3600) : null,
-          })),
+          user.profile.resumes.map(async (r) => {
+            const [thumbnailUrl, downloadUrl] = await Promise.all([
+              r.thumbnailKey ? this.s3.getPresignedDownloadUrl(r.thumbnailKey, 3600) : null,
+              this.s3.getPresignedDownloadUrl(r.key, 3600),
+            ])
+            return { ...r, thumbnailUrl, downloadUrl }
+          }),
         )
       : []
 
